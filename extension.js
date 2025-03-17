@@ -15,6 +15,7 @@
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
+import {default as GObject} from 'gi://GObject';
 import {default as GLib} from 'gi://GLib';
 import {default as Shell} from 'gi://Shell';
 import {Extension, InjectionManager} from 'resource:///org/gnome/shell/extensions/extension.js';
@@ -30,17 +31,20 @@ export default class FixRemoteWindowIcons extends Extension {
         this._fixedWindows = new Map();
 
         this._injectionManager = new InjectionManager();
-        this._override_ShellWindowTracker_get_window_app();
+        this._override_ShellWindowTracker_focus_app();
         this._override_ShellWindowTracker_get_app_from_pid();
+        this._override_ShellWindowTracker_get_window_app();
+        this._override_ShellAppSystem_get_running();
+        this._override_ShellApp_activate();
+        this._override_ShellApp_get_n_windows();
+        this._override_ShellApp_get_pids();
+        this._override_ShellApp_get_state();
+        this._override_ShellApp_get_windows();
+        this._override_ShellApp_is_on_workspace();
+        this._override_ShellApp_state();
         this._override_MetaWindow_get_gtk_application_id();
         // this._override_MetaWindow_get_gtk_application_object_path();
         this._override_MetaWindow_is_remote();
-        this._override_ShellApp_get_n_windows();
-        this._override_ShellApp_get_pids();
-        this._override_ShellApp_get_windows();
-        this._override_ShellApp_is_on_workspace();
-        this._override_ShellApp_get_state();
-        this._override_ShellAppSystem_get_running();
 
         this._windowCreatedSignal = global.display.connect("window-created", (_, win) => {
             this._log(`New ${this._windowNameForLogging(win)} created`);
@@ -54,6 +58,9 @@ export default class FixRemoteWindowIcons extends Extension {
         global.display.disconnect(this._windowCreatedSignal);
         this._windowCreatedSignal = null;
 
+        for (w of this._fixedWindows) {
+            w[1].win.disconnect(w[1].focusSignal);
+        }
         for (toBeCleared of [
             '_fixedWindows',
             '_foundWindows',
@@ -89,6 +96,9 @@ export default class FixRemoteWindowIcons extends Extension {
                 this._log(`- ${this._windowNameForLogging(win)} was fixed by us, unfixing`);
                 this._fixedWindows.delete(win);
                 winFix.app.emit('windows-changed');
+                winFix.app.emit('notify::state');
+                Shell.AppSystem.get_default().emit('app-state-changed', winFix.app);
+                global.get_window_tracker().emit('tracked-windows-changed')
             }
         });
 
@@ -128,6 +138,9 @@ export default class FixRemoteWindowIcons extends Extension {
             dummyApp: autoDetectedApp,
             app: matchingApp,
             pid: win.get_pid(),
+            focusSignal: win.connect('focus', () => {
+                matchingApp.activate_window(win, global.get_current_time());
+            })
         })
         Object.defineProperty(win, 'gtk_application_id', {
             get: () => matchingApp.get_id(),
@@ -136,7 +149,9 @@ export default class FixRemoteWindowIcons extends Extension {
         //     get: () => matchingApp.get_object_path(),
         // })
         matchingApp.emit('windows-changed');
+        matchingApp.notify('state')
         Shell.AppSystem.get_default().emit('app-state-changed', matchingApp);
+        global.get_window_tracker().emit('tracked-windows-changed')
         return GLib.SOURCE_REMOVE;
     }
 
@@ -164,19 +179,37 @@ export default class FixRemoteWindowIcons extends Extension {
         return this._fixedWindows.get(win);
     }
 
-    _override_ShellWindowTracker_get_window_app() {
-        this._injectionManager.overrideMethod(Shell.WindowTracker.prototype, 'get_window_app', originalMethod => {
-            // this._injectionManager.overrideMethod(Shell.WindowTracker, 'get_window_app', originalMethod => {
-            return function (win) {
-                TheExtension._log(`get_window_app(${TheExtension._windowNameForLogging(win)})`);
-                return TheExtension._findFixForWindow(win)?.app || originalMethod.call(this, win);
+    _override_ShellWindowTracker_focus_app() {
+        // TODO: restore the original getter when the extension is disabled
+        const
+            originalGetter = Object.getOwnPropertyDescriptor(Shell.WindowTracker.prototype, 'focus_app').get
+        Object.defineProperty(Shell.WindowTracker.prototype, 'focus_app', {
+            get() {
+                const
+                    focusedWin = global.display.get_focus_window();
+                return TheExtension._findFixForWindow(focusedWin)?.app || originalGetter.call(this);
+            }
+        })
+    }
+
+    _override_ShellApp_state() {
+        // TODO: restore the original getter when the extension is disabled
+        const
+            originalGetter = Object.getOwnPropertyDescriptor(Shell.App.prototype, 'state').get
+        Object.defineProperty(Shell.App.prototype, 'state', {
+            get() {
+                const
+                    fixedWindows = [...TheExtension._fixedWindows.keys()].filter(win => TheExtension._findFixForWindow(win)?.app === this),
+                    isRunning = fixedWindows.some(win => win.get_workspace() !== null);
+                if (originalGetter.call(this) === Shell.AppState.STOPPED && isRunning)
+                    return Shell.AppState.RUNNING;
+                return originalGetter.call(this);
             }
         })
     }
 
     _override_ShellWindowTracker_get_app_from_pid() {
         this._injectionManager.overrideMethod(Shell.WindowTracker.prototype, 'get_app_from_pid', originalMethod => {
-            // this._injectionManager.overrideMethod(Shell.WindowTracker, 'get_app_from_pid', originalMethod => {
             return function (pid) {
                 TheExtension._log(`get_app_from_pid(${pid})`);
                 return [...TheExtension._fixedWindows.values()].find(({pid: p}) => p === pid)?.app || originalMethod.call(this, pid);
@@ -184,26 +217,52 @@ export default class FixRemoteWindowIcons extends Extension {
         })
     }
 
-    _override_MetaWindow_get_gtk_application_id() {
-        this._injectionManager.overrideMethod(Meta.Window, 'get_gtk_application_id', originalMethod => {
-            return function () {
-                return TheExtension._findFixForWindow(this)?.app.get_id() || originalMethod.call(this);
+    _override_ShellWindowTracker_get_window_app() {
+        this._injectionManager.overrideMethod(Shell.WindowTracker.prototype, 'get_window_app', originalMethod => {
+            return function (win) {
+                TheExtension._log(`get_window_app(${TheExtension._windowNameForLogging(win)})`);
+                return TheExtension._findFixForWindow(win)?.app || originalMethod.call(this, win);
             }
         })
     }
 
-    _override_MetaWindow_get_gtk_application_object_path() {
-        this._injectionManager.overrideMethod(Meta.Window, 'get_gtk_application_object_path', originalMethod => {
+    _override_ShellAppSystem_get_running() {
+        this._injectionManager.overrideMethod(Shell.AppSystem.prototype, 'get_running', originalMethod => {
             return function () {
-                return TheExtension._findFixForWindow(this)?.app.get_object_path() || originalMethod.call(this);
+                // [Original result] + [Our apps from _fixedWindows] - [Dummy apps from _fixedWindows]
+                const
+                    originalResult = [...originalMethod.call(this)],
+                    fixedWindows = [...TheExtension._fixedWindows.values()],
+                    fixedApps = fixedWindows.map(fix => fix.app),
+                    dummyApps = fixedWindows.map(fix => fix.dummyApp);
+                return originalResult.concat(fixedApps).filter(app => !dummyApps.includes(app));
             }
         })
     }
 
-    _override_MetaWindow_is_remote() {
-        this._injectionManager.overrideMethod(Meta.Window, 'is_remote', originalMethod => {
+    _override_ShellApp_activate() {
+        this._injectionManager.overrideMethod(Shell.App.prototype, 'activate', originalMethod => {
             return function () {
-                return !!TheExtension._findFixForWindow(this) || originalMethod.call(this);
+                // we do nothing if the app is a dummy app auto-created by the system
+                if ([...TheExtension._fixedWindows.values()].some(fix => fix.dummyApp === this))
+                    return;
+
+                // if the app is one of the apps we fixed, we have to simulate the "activate" behavior of ShellApp#activate
+                // let's do it in a crude way for now:
+                // - if the first "normal" window is minimized, we show all windows
+                // - otherwise we minimize all windows
+                const
+                    fixedWindows = [...TheExtension._fixedWindows.keys()].filter(win => TheExtension._findFixForWindow(win)?.app === this),
+                    firstNormalWindow = fixedWindows.find(win => win.get_window_type() === Meta.WindowType.NORMAL),
+                    firstOtherWindow = fixedWindows.find(win => win.get_window_type() !== Meta.WindowType.NORMAL),
+                    shouldBeShown = firstNormalWindow?.minimized || firstOtherWindow?.minimized;
+                if (shouldBeShown) {
+                    fixedWindows.forEach(win => win.activate(global.get_current_time()));
+                } else {
+                    fixedWindows.forEach(win => win.minimize());
+                }
+
+                originalMethod.call(this);
             }
         })
     }
@@ -248,20 +307,6 @@ export default class FixRemoteWindowIcons extends Extension {
         })
     }
 
-    _override_ShellApp_is_on_workspace() {
-        this._injectionManager.overrideMethod(Shell.App.prototype, 'is_on_workspace', originalMethod => {
-            return function (workspace) {
-                // we return false if the app is a dummy app auto-created by the system
-                if ([...TheExtension._fixedWindows.values()].some(fix => fix.dummyApp === this))
-                    return false;
-
-                return [...TheExtension._fixedWindows.values()]
-                        .some(fix => fix.app === this && fix.win.get_workspace() === workspace) ||
-                    originalMethod.call(this, workspace);
-            }
-        })
-    }
-
     _override_ShellApp_get_state() {
         this._injectionManager.overrideMethod(Shell.App.prototype, 'get_state', originalMethod => {
             return function () {
@@ -280,25 +325,41 @@ export default class FixRemoteWindowIcons extends Extension {
         })
     }
 
-    _override_ShellAppSystem_get_running() {
-        this._injectionManager.overrideMethod(Shell.AppSystem.prototype, 'get_running', originalMethod => {
+    _override_ShellApp_is_on_workspace() {
+        this._injectionManager.overrideMethod(Shell.App.prototype, 'is_on_workspace', originalMethod => {
+            return function (workspace) {
+                // we return false if the app is a dummy app auto-created by the system
+                if ([...TheExtension._fixedWindows.values()].some(fix => fix.dummyApp === this))
+                    return false;
+
+                return [...TheExtension._fixedWindows.values()]
+                        .some(fix => fix.app === this && fix.win.get_workspace() === workspace) ||
+                    originalMethod.call(this, workspace);
+            }
+        })
+    }
+
+    _override_MetaWindow_get_gtk_application_id() {
+        this._injectionManager.overrideMethod(Meta.Window, 'get_gtk_application_id', originalMethod => {
             return function () {
-                // [Original result] + [Our apps from _fixedWindows] - [Dummy apps from _fixedWindows]
-                const
-                    originalResult = [...originalMethod.call(this)],
-                    fixedWindows = [...TheExtension._fixedWindows.values()],
-                    fixedApps = fixedWindows.map(fix => fix.app),
-                    dummyApps = fixedWindows.map(fix => fix.dummyApp);
-                return originalResult.concat(fixedApps).filter(app => !dummyApps.includes(app));
+                return TheExtension._findFixForWindow(this)?.app.get_id() || originalMethod.call(this);
             }
         })
     }
 
     // _override_MetaWindow_get_gtk_application_object_path() {
     //     this._injectionManager.overrideMethod(Meta.Window, 'get_gtk_application_object_path', originalMethod => {
-    //         return function() {
-    //             return TheExtension._overriddenWindows.get(this)?.app.get_object_path() || originalMethod.call(this);
+    //         return function () {
+    //             return TheExtension._findFixForWindow(this)?.app.get_object_path() || originalMethod.call(this);
     //         }
     //     })
     // }
+
+    _override_MetaWindow_is_remote() {
+        this._injectionManager.overrideMethod(Meta.Window, 'is_remote', originalMethod => {
+            return function () {
+                return !!TheExtension._findFixForWindow(this) || originalMethod.call(this);
+            }
+        })
+    }
 }
