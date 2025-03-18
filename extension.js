@@ -15,22 +15,49 @@
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
-import {default as GObject} from 'gi://GObject';
-import {default as GLib} from 'gi://GLib';
 import {default as Shell} from 'gi://Shell';
-import {Extension, InjectionManager} from 'resource:///org/gnome/shell/extensions/extension.js';
 import {default as Meta} from 'gi://Meta';
+import {Extension, InjectionManager} from 'resource:///org/gnome/shell/extensions/extension.js';
 
 let TheExtension = null;
+const
+    appSystem = Shell.AppSystem.get_default(),
+    windowTracker = Shell.WindowTracker.get_default();
 
 export default class FixRemoteWindowIcons extends Extension {
     enable() {
         TheExtension = this;
+        this._toDoWhenDisabled = [];
 
-        this._foundWindows = new Set();
-        this._fixedWindows = new Map();
-
+        // it is important that releasing overrides is the first todo when disabling
         this._injectionManager = new InjectionManager();
+        this._toDoWhenDisabled.push(() => {
+            TheExtension._injectionManager?.clear();
+            TheExtension._injectionManager = null;
+        });
+
+        this._foundWindows = new Map();
+        this._toDoWhenDisabled.push(() => {
+            if (this._foundWindows) {
+                for (let w of this._foundWindows) {
+                    w[0].disconnect(w[1].unmanagedSignal);
+                }
+                this._foundWindows.clear();
+            }
+            this._foundWindows = null;
+        })
+
+        this._fixedWindows = new Map();
+        this._toDoWhenDisabled.push(() => {
+            if (this._fixedWindows) {
+                for (let w of this._fixedWindows) {
+                    w[0].disconnect(w[1].focusSignal);
+                }
+                this._fixedWindows.clear();
+            }
+            this._fixedWindows = null;
+        })
+
         this._override_ShellWindowTracker_focus_app();
         this._override_ShellWindowTracker_get_app_from_pid();
         this._override_ShellWindowTracker_get_window_app();
@@ -43,33 +70,29 @@ export default class FixRemoteWindowIcons extends Extension {
         this._override_ShellApp_is_on_workspace();
         this._override_ShellApp_state();
         this._override_MetaWindow_get_gtk_application_id();
+        this._override_MetaWindow_gtk_application_id();
         // this._override_MetaWindow_get_gtk_application_object_path();
         this._override_MetaWindow_is_remote();
 
         this._windowCreatedSignal = global.display.connect("window-created", (_, win) => {
             this._log(`New ${this._windowNameForLogging(win)} created`);
-            this._fixWindowWhenWeCan(win);
+            this._fixWindowIfNeeded(win);
             return win;
         })
+        this._toDoWhenDisabled.push(() => {
+            global.display.disconnect(this._windowCreatedSignal);
+            this._windowCreatedSignal = null;
+        })
+
         this._fixExistingWindows();
     }
 
     disable() {
-        global.display.disconnect(this._windowCreatedSignal);
-        this._windowCreatedSignal = null;
-
-        for (w of this._fixedWindows) {
-            w[1].win.disconnect(w[1].focusSignal);
+        if (!TheExtension || !TheExtension._toDoWhenDisabled) return;
+        for (let toDo of TheExtension._toDoWhenDisabled) {
+            toDo();
         }
-        for (toBeCleared of [
-            '_fixedWindows',
-            '_foundWindows',
-            '_injectionManager',
-        ]) {
-            this[toBeCleared]?.clear();
-            this[toBeCleared] = null
-        }
-
+        TheExtension._toDoWhenDisabled = null;
         TheExtension = null;
     }
 
@@ -78,16 +101,15 @@ export default class FixRemoteWindowIcons extends Extension {
             let win = actor.get_meta_window();
             if (win) {
                 this._log(`Checking existing ${this._windowNameForLogging(win)}`);
-                this._fixWindowWhenWeCan(win);
+                this._fixWindowIfNeeded(win);
             }
         });
     }
 
-    _fixWindowWhenWeCan(win) {
+    _fixWindowIfNeeded(win) {
         if (this._foundWindows.has(win)) return;
 
-        this._foundWindows.add(win);
-        win.connect("unmanaged", () => {
+        const unmanagedSignal = win.connect("unmanaged", () => {
             this._log(`Unmanaging ${this._windowNameForLogging(win)}`);
             this._foundWindows.delete(win)
             const
@@ -95,14 +117,17 @@ export default class FixRemoteWindowIcons extends Extension {
             if (winFix) {
                 this._log(`- ${this._windowNameForLogging(win)} was fixed by us, unfixing`);
                 this._fixedWindows.delete(win);
+
+                winFix.app.notify('state');
+                appSystem.emit('app-state-changed', winFix.app);
+
                 winFix.app.emit('windows-changed');
-                winFix.app.emit('notify::state');
-                Shell.AppSystem.get_default().emit('app-state-changed', winFix.app);
-                global.get_window_tracker().emit('tracked-windows-changed')
+                windowTracker.emit('tracked-windows-changed')
             }
         });
+        this._foundWindows.set(win, {unmanagedSignal});
 
-        GLib.idle_add(GLib.PRIORITY_DEFAULT, this._fixWindow.bind(this, win));
+        this._fixWindow(win);
     }
 
     _fixWindow(win) {
@@ -111,7 +136,7 @@ export default class FixRemoteWindowIcons extends Extension {
         this._log(`Processing ${this._windowNameForLogging(win)}`);
         if (!windowClass) {
             this._log(`- ${this._windowNameForLogging(win)}" has no WM_CLASS, so it can't be linked to an app`);
-            return GLib.SOURCE_REMOVE;
+            return false;
         }
 
         const
@@ -120,49 +145,55 @@ export default class FixRemoteWindowIcons extends Extension {
         this._log(`- ${this._windowNameForLogging(win)} .app is set to ${autoDetectedApp?.get_id()}`);
         if (appInfo) {
             this._log(`- ${this._windowNameForLogging(win)} is already linked to app ${appInfo.get_name()}`);
-            return GLib.SOURCE_REMOVE;
+            return false;
         }
 
-        // TODO: use the corresponding methods from Shell.AppSystem:
-        //   - lookup_desktop_wmclass
-        //   - lookup_heuristic_basename
-        //   - lookup_startup_wmclass
         const
-            matchingApp = this._findAppByDesktopFile(windowClass) || this._findAppByDesktopFile(windowClass.toLowerCase())
+            matchingApp =
+                appSystem.lookup_desktop_wmclass(windowClass) ||
+                appSystem.lookup_heuristic_basename(windowClass) ||
+                appSystem.lookup_startup_wmclass(windowClass)
         if (!matchingApp) {
             this._log(`- Found no local app matching window class ${windowClass}`);
-            return GLib.SOURCE_REMOVE;
+            return false;
         }
+        this._log(`- Found local app ${matchingApp.get_id()} matching window class ${windowClass}`);
 
         this._fixedWindows.set(win, {
+            // if the app system fails to find the app, it creates a dummy app
+            // https://gitlab.gnome.org/GNOME/gnome-shell/-/blob/gnome-47/src/shell-app-system.c?ref_type=heads#L356
             dummyApp: autoDetectedApp,
+
             app: matchingApp,
             pid: win.get_pid(),
             focusSignal: win.connect('focus', () => {
                 matchingApp.activate_window(win, global.get_current_time());
             })
         })
-        Object.defineProperty(win, 'gtk_application_id', {
-            get: () => matchingApp.get_id(),
-        })
+        // Object.defineProperty(win, 'gtk_application_id', {
+        //     get: () => matchingApp.get_id(),
+        // })
         // Object.defineProperty(win, 'gtk_application_object_path', {
         //     get: () => matchingApp.get_object_path(),
         // })
-        matchingApp.emit('windows-changed');
+
         matchingApp.notify('state')
-        Shell.AppSystem.get_default().emit('app-state-changed', matchingApp);
-        global.get_window_tracker().emit('tracked-windows-changed')
-        return GLib.SOURCE_REMOVE;
+        appSystem.emit('app-state-changed', matchingApp);
+
+        matchingApp.emit('windows-changed');
+        windowTracker.emit('tracked-windows-changed')
+
+        return true;
     }
 
-    _findAppByDesktopFile(fileName) {
-        const app = Shell.AppSystem.get_default().lookup_app(`${fileName}.desktop`);
-        if (app)
-            this._log(`- Found file ${fileName}.desktop which refers to app ${app.get_name()}`);
-        else
-            this._log(`- File ${fileName}.desktop not found`)
-        return app;
-    }
+    // _findAppByDesktopFile(fileName) {
+    //     const app = Shell.AppSystem.get_default().lookup_app(`${fileName}.desktop`);
+    //     if (app)
+    //         this._log(`- Found file ${fileName}.desktop which refers to app ${app.get_name()}`);
+    //     else
+    //         this._log(`- File ${fileName}.desktop not found`)
+    //     return app;
+    // }
 
     _log(...args) {
         log('[FRWI]', ...args);
@@ -180,22 +211,33 @@ export default class FixRemoteWindowIcons extends Extension {
     }
 
     _override_ShellWindowTracker_focus_app() {
-        // TODO: restore the original getter when the extension is disabled
-        const
-            originalGetter = Object.getOwnPropertyDescriptor(Shell.WindowTracker.prototype, 'focus_app').get
+        const originalGetter =
+            Object.getOwnPropertyDescriptor(Shell.WindowTracker.prototype, 'focus_app').get
+        this._toDoWhenDisabled.push(() => {
+            Object.defineProperty(Shell.WindowTracker.prototype, 'focus_app', {
+                get: originalGetter
+            })
+        });
+
         Object.defineProperty(Shell.WindowTracker.prototype, 'focus_app', {
             get() {
                 const
                     focusedWin = global.display.get_focus_window();
-                return TheExtension._findFixForWindow(focusedWin)?.app || originalGetter.call(this);
+                return TheExtension._findFixForWindow(focusedWin)?.app ||
+                    originalGetter.call(this);
             }
         })
     }
 
     _override_ShellApp_state() {
-        // TODO: restore the original getter when the extension is disabled
         const
             originalGetter = Object.getOwnPropertyDescriptor(Shell.App.prototype, 'state').get
+        this._toDoWhenDisabled.push(() => {
+            Object.defineProperty(Shell.App.prototype, 'state', {
+                get: originalGetter
+            })
+        });
+
         Object.defineProperty(Shell.App.prototype, 'state', {
             get() {
                 const
@@ -343,6 +385,21 @@ export default class FixRemoteWindowIcons extends Extension {
         this._injectionManager.overrideMethod(Meta.Window, 'get_gtk_application_id', originalMethod => {
             return function () {
                 return TheExtension._findFixForWindow(this)?.app.get_id() || originalMethod.call(this);
+            }
+        })
+    }
+
+    _override_MetaWindow_gtk_application_id() {
+        const originalGetter = Object.getOwnPropertyDescriptor(Meta.Window.prototype, 'gtk_application_id').get;
+        this._toDoWhenDisabled.push(() => {
+            Object.defineProperty(Meta.Window.prototype, 'gtk_application_id', {
+                get: originalGetter
+            })
+        });
+
+        Object.defineProperty(Meta.Window.prototype, 'gtk_application_id', {
+            get() {
+                return TheExtension._findFixForWindow(this)?.app.get_id() || originalGetter.call(this);
             }
         })
     }
