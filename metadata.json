@@ -4,5 +4,10 @@
   "uuid": "fix-remote-window-icons@com.github.phaengris",
   "shell-version": [
     "47"
-  ]
+  ],
+  "url": "https://github.com/Phaengris/fix-remote-window-icons",
+  "version-name": "0.0.1",
+  "donations": {
+    "github": "Phaengris"
+  }
 }
