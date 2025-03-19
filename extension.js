@@ -20,9 +20,6 @@ import {default as Meta} from 'gi://Meta';
 import {Extension, InjectionManager} from 'resource:///org/gnome/shell/extensions/extension.js';
 
 let TheExtension = null;
-const
-    appSystem = Shell.AppSystem.get_default(),
-    windowTracker = Shell.WindowTracker.get_default();
 
 export default class FixRemoteWindowIcons extends Extension {
     enable() {
@@ -34,6 +31,13 @@ export default class FixRemoteWindowIcons extends Extension {
         this._toDoWhenDisabled.push(() => {
             TheExtension._injectionManager?.clear();
             TheExtension._injectionManager = null;
+        });
+
+        this._appSystem = Shell.AppSystem.get_default()
+        this._windowTracker = Shell.WindowTracker.get_default();
+        this._toDoWhenDisabled.push(() => {
+            this._appSystem = null;
+            this._windowTracker = null;
         });
 
         this._foundWindows = new Map();
@@ -119,10 +123,10 @@ export default class FixRemoteWindowIcons extends Extension {
                 this._fixedWindows.delete(win);
 
                 winFix.app.notify('state');
-                appSystem.emit('app-state-changed', winFix.app);
+                this._appSystem.emit('app-state-changed', winFix.app);
 
                 winFix.app.emit('windows-changed');
-                windowTracker.emit('tracked-windows-changed')
+                this._windowTracker.emit('tracked-windows-changed')
             }
         });
         this._foundWindows.set(win, {unmanagedSignal});
@@ -150,9 +154,9 @@ export default class FixRemoteWindowIcons extends Extension {
 
         const
             matchingApp =
-                appSystem.lookup_desktop_wmclass(windowClass) ||
-                appSystem.lookup_heuristic_basename(windowClass) ||
-                appSystem.lookup_startup_wmclass(windowClass)
+                this._appSystem.lookup_desktop_wmclass(windowClass) ||
+                this._appSystem.lookup_heuristic_basename(windowClass) ||
+                this._appSystem.lookup_startup_wmclass(windowClass)
         if (!matchingApp) {
             this._log(`- Found no local app matching window class ${windowClass}`);
             return false;
@@ -178,10 +182,10 @@ export default class FixRemoteWindowIcons extends Extension {
         // })
 
         matchingApp.notify('state')
-        appSystem.emit('app-state-changed', matchingApp);
+        this._appSystem.emit('app-state-changed', matchingApp);
 
         matchingApp.emit('windows-changed');
-        windowTracker.emit('tracked-windows-changed')
+        this._windowTracker.emit('tracked-windows-changed')
 
         return true;
     }
