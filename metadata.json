@@ -3,6 +3,7 @@
   "description": "This extension restores proper icon and app associations for remote X11 (Xwayland) windows that GNOME Shell fails to recognize. It ensures that applications running in Incus containers, SSH X forwarding, or other remote environments display the correct icons in the dock and allow pinning.",
   "uuid": "fix-remote-window-icons@com.github.phaengris",
   "shell-version": [
+    "46",
     "47"
   ],
   "url": "https://github.com/Phaengris/fix-remote-window-icons",
